@@ -5,20 +5,70 @@ import tensorflow as tf
 import joblib
 import re
 import os
+from datetime import datetime
+import sqlite3
 
 # --- Google Gemini API integration ---
 import google.generativeai as genai
 
-# --- Enter your Gemini API key here (REQUIRED) ---
-GEMINI_API_KEY = "AIzaSyBDB7CFOaTNcCQUPiAMk5uksfFKdX2J4Wg"  # Replace with your actual key
-
+# =============== CONFIG ===============
+# Provide your Gemini API key
+GEMINI_API_KEY = "AIzaSyBDB7CFOaTNcCQUPiAMk5uksfFKdX2J4Wg"
 genai.configure(api_key=GEMINI_API_KEY)
 
-# ---- App Configuration ----
-st.set_page_config(page_title="AI Learning Path Generator", page_icon="🎓", layout="wide")
-st.title("🎓 AI-Powered Personalized Learning Path Generator")
+# SQLite DB path (set to Drive path in Colab for persistence)
+DB_PATH = "user_progress.db"
 
-# ---- MCA Curriculum ----
+# =============== DB SETUP ===============
+def init_db():
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True) if os.path.dirname(DB_PATH) else None
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS progress (
+            roll TEXT NOT NULL,
+            subject TEXT NOT NULL,
+            semester TEXT NOT NULL,
+            plan TEXT NOT NULL,
+            week1_done INTEGER DEFAULT 0,
+            week2_done INTEGER DEFAULT 0,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (roll, subject)
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def save_plan(roll, subject, semester, plan, week1=False, week2=False):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        INSERT OR REPLACE INTO progress(roll, subject, semester, plan, week1_done, week2_done, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (roll, subject, semester, plan, int(week1), int(week2), datetime.now().isoformat(timespec="seconds")))
+    conn.commit()
+    conn.close()
+
+def load_all_plans_for_roll(roll):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        SELECT subject, semester, plan, week1_done, week2_done, updated_at
+        FROM progress
+        WHERE roll=?
+        ORDER BY subject
+    """, (roll,))
+    rows = c.fetchall()
+    conn.close()
+    return rows  # list of tuples
+
+init_db()
+
+# =============== STREAMLIT APP CONFIG ===============
+st.set_page_config(page_title="AI Learning Path Generator", page_icon="🎓", layout="wide")
+st.title("🎓 PathWise: AI-Powered Personalized Learning Path Generator")
+
+# =============== CURRICULUM ===============
 MCA_CURRICULUM = {
     "Semester 1": [
         "Algorithm_&_Program_Design",
@@ -44,6 +94,7 @@ MCA_CURRICULUM = {
 }
 subject_list = [subj for sem in MCA_CURRICULUM.values() for subj in sem]
 
+# =============== MODELS ===============
 @st.cache_resource
 def load_models_and_scalers():
     try:
@@ -58,16 +109,22 @@ def load_models_and_scalers():
 
 model_minors, model_full, scaler_minor, scaler_full = load_models_and_scalers()
 
-# ---- Sidebar: User Inputs ----
-st.sidebar.header("Enter Your Scores")
+# =============== SIDEBAR INPUTS ===============
+st.sidebar.header("Generate Your Plan:")
+# Capture roll number for auto-save
+roll_number = st.sidebar.text_input("Enter your MCA Roll Number:", key="roll_input")
+
+# =============== SIDEBAR: VIEW YOUR PLAN (minimal) ===============
+if st.sidebar.button("📑 View Your Plan"):
+    st.session_state.show_view = True
+
+st.sidebar.markdown("---")
 selected_semester = st.sidebar.selectbox("Select a Semester", options=list(MCA_CURRICULUM.keys()))
 subjects_for_semester = MCA_CURRICULUM[selected_semester]
-score_mode = st.sidebar.radio(
-    "Which marks?", ["Minors Only", "Minors + EndSem"], horizontal=True
-)
+score_mode = st.sidebar.radio("Which marks?", ["Minors Only", "Minors + EndSem"], horizontal=True)
 include_endsem = (score_mode == "Minors + EndSem")
-entered_marks = {}
 
+entered_marks = {}
 with st.sidebar.form(key="marks_form"):
     st.write(f"**Enter marks for {selected_semester}:**")
     for subject in subjects_for_semester:
@@ -82,6 +139,7 @@ with st.sidebar.form(key="marks_form"):
         entered_marks[subject] = {"Minor1": m1, "Minor2": m2, "EndSem": es}
     submitted = st.form_submit_button("🔍 Generate Learning Path")
 
+# =============== FEATURE PREP & PREDICTION ===============
 def prepare_input_vector(subject_list, entered_marks, include_endsem):
     feats = []
     for subj in subject_list:
@@ -105,6 +163,7 @@ def predict_weak_subjects_show_only_entered(model, scaler, subject_list, entered
     out = {subj: pred_dict[subj] for subj in entered_marks}
     return out
 
+# =============== PROMPT + CLEANING ===============
 def improved_prompt(subject, marks, semester):
     return (
         f"A student is weak in {subject.replace('_', ' ')} "
@@ -133,8 +192,8 @@ def gemini_generate_plan(prompt):
     response = model.generate_content(prompt)
     return response.text
 
-
-def generate_llm_plan(weak_subjects, entered_marks, semester):
+# =============== PLAN GENERATION (keeps your flow) ===============
+def generate_llm_plan(weak_subjects, entered_marks, semester, roll_number):
     if not weak_subjects:
         return "✅ Great job! No weak subjects detected."
     plan = "### Your Personalized AI-Generated Learning Path\n"
@@ -144,10 +203,20 @@ def generate_llm_plan(weak_subjects, entered_marks, semester):
         with st.spinner(f"Gemini is generating your personalized plan for {subject}..."):
             ai_raw = gemini_generate_plan(prompt)
         ai_plan = clean_llm_output(ai_raw)
+
+        # Auto-save the plan if roll number is provided
+        try:
+            if roll_number:
+                save_plan(roll_number, subject.replace('_',' '), semester, ai_plan, week1=False, week2=False)
+                st.toast(f"Auto-saved plan for {subject.replace('_',' ')} (Roll: {roll_number}).")
+        except Exception as e:
+            st.error(f"Could not save plan for {subject}: {e}")
+
         plan += f"\n\n#### {subject.replace('_',' ')}\n\n{ai_plan}\n\n---\n"
-    plan += "*This plan was generated by Google Gemini API (free tier).*"
+    plan += "*This plan was generated by Google Gemini API.*"
     return plan
 
+# =============== MAIN EXECUTION ===============
 if submitted:
     st.header("Analysis Results")
     marks_list = []
@@ -163,12 +232,15 @@ if submitted:
     st.dataframe(marks_df)
 
     with st.spinner("AI is analyzing your performance..."):
-        if include_endsem:
+        if include_endsem and model_full and scaler_full:
             preds = predict_weak_subjects_show_only_entered(
                 model_full, scaler_full, subject_list, entered_marks, include_endsem)
-        else:
+        elif model_minors and scaler_minor:
             preds = predict_weak_subjects_show_only_entered(
                 model_minors, scaler_minor, subject_list, entered_marks, include_endsem)
+        else:
+            preds = {k: 0.0 for k in entered_marks}
+
         weak_subjects = [k.replace("_", " ") for k, v in preds.items() if v > 0.5]
 
     st.write("**Model Results (only for entered subjects):**")
@@ -179,6 +251,23 @@ if submitted:
         st.success("No weak subjects detected for entered marks!")
     st.markdown("---")
     st.subheader("Your AI Learning Path")
-    st.markdown(generate_llm_plan(weak_subjects, entered_marks, selected_semester))
+    st.markdown(generate_llm_plan(weak_subjects, entered_marks, selected_semester, roll_number))
 
-st.caption("Powered by Google Gemini Pro API and Tensorflow. All logic runs securely in your app.")
+
+
+if st.session_state.get("show_view", False):
+
+    if roll_number:
+        all_rows = load_all_plans_for_roll(roll_number)
+        if not all_rows:
+            st.sidebar.info("No saved plans found for this roll. Generate plans first.")
+        else:
+            st.success(f"Found {len(all_rows)} subject plan(s) for {roll_number}")
+            st.markdown("## Your Saved Learning Paths")
+            for subject, semester, plan_text, w1, w2, updated in all_rows:
+                st.markdown(f"### {subject} ({semester})")
+                st.caption(f"Last updated: {updated} • Week1: {'✅' if w1 else '⬜'} • Week2: {'✅' if w2 else '⬜'}")
+                st.markdown(plan_text)
+                st.markdown("---")
+
+st.caption("Powered by Google Gemini and TensorFlow. Learning paths auto-saved by roll number.")
