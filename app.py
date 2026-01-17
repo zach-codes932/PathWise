@@ -13,11 +13,19 @@ import google.generativeai as genai
 
 # =============== CONFIG ===============
 # Provide your Gemini API key
-GEMINI_API_KEY = "AIzaSyBDB7CFOaTNcCQUPiAMk5uksfFKdX2J4Wg"
+try:
+    GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
+except FileNotFoundError:
+    st.error("Secrets file not found. Please create .streamlit/secrets.toml with your GEMINI_API_KEY.")
+    st.stop()
+except KeyError:
+    st.error("GEMINI_API_KEY not found in secrets.toml.")
+    st.stop()
+
 genai.configure(api_key=GEMINI_API_KEY)
 
 # SQLite DB path (set to Drive path in Colab for persistence)
-DB_PATH = "user_progress.db"
+DB_PATH = os.path.join("data", "user_progress.db")
 
 # =============== DB SETUP ===============
 def init_db():
@@ -98,10 +106,10 @@ subject_list = [subj for sem in MCA_CURRICULUM.values() for subj in sem]
 @st.cache_resource
 def load_models_and_scalers():
     try:
-        model_minors = tf.keras.models.load_model("WeaknessPredictor_MinorsOnly.h5")
-        model_full = tf.keras.models.load_model("WeaknessPredictor_FullData.h5")
-        scaler_minor = joblib.load("minmax_scaler_minor.pkl")
-        scaler_full = joblib.load("minmax_scaler_full.pkl")
+        model_minors = tf.keras.models.load_model(os.path.join("models", "WeaknessPredictor_MinorsOnly.h5"))
+        model_full = tf.keras.models.load_model(os.path.join("models", "WeaknessPredictor_FullData.h5"))
+        scaler_minor = joblib.load(os.path.join("models", "minmax_scaler_minor.pkl"))
+        scaler_full = joblib.load(os.path.join("models", "minmax_scaler_full.pkl"))
         return model_minors, model_full, scaler_minor, scaler_full
     except Exception as e:
         st.error(f"❌ Error loading models/scalers: {e}")
